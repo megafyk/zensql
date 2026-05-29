@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(incremental-implementation)",
+      "Write",
+      "Edit",
+      "Bash(uv --version)",
+      "Bash(uv python *)",
+      "Bash(uv sync *)",
+      "Bash(uv run *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(wc *)"
+    ]
+  }
+}

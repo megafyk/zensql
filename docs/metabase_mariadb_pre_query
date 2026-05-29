@@ -1,0 +1,8 @@
+-- get list partitions of a table
+select * from information_schema.partitions where table_name = 'log_central';
+
+-- get columns definition of a table
+select * from information_schema.columns where table_name = 'log_central';
+
+-- get indexes of a table
+select * from information_schema.statistics where table_name = 'log_central';

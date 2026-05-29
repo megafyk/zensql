@@ -1,0 +1,8 @@
+curl 'http://metabase.digital.vn/api/dataset' \
+  -H 'Referer: http://metabase.digital.vn/question' \
+  -H 'User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36' \
+  -H 'Accept: application/json' \
+  -H 'DNT: 1' \
+  -H 'Content-Type: application/json' \
+  --data-raw '{"database":312,"native":{"template-tags":{},"query":"select * from cdcn_log_central.log_central"},"type":"native","parameters":[]}' \
+  --insecure

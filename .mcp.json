@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "schema": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "zen.schema_mcp.server"],
+      "env": {}
+    },
+    "code-review-graph": {
+      "command": "uv",
+      "args": ["run", "code-review-graph", "serve"],
+      "env": {}
+    }
+  }
+}
