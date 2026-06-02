@@ -33,7 +33,8 @@ class Settings(BaseSettings):
     agent_api_port: int = Field(default=8080, ge=1, le=65535)
     agent_api_token: SecretStr = Field(default=SecretStr(""))
     agent_api_base_url: str = Field(default="http://127.0.0.1:8080")
-    agent_timeout_s: int = Field(default=60, ge=1, le=600)
+    # Max wall-clock for one `claude -p` run; the model can be slow, so allow 5 min.
+    agent_timeout_s: int = Field(default=300, ge=1, le=600)
     allowed_statement_families: Annotated[list[StatementFamily], NoDecode] = Field(
         default_factory=lambda: [StatementFamily.SELECT]
     )

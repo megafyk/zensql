@@ -37,7 +37,7 @@ def test_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     s = Settings(_env_file=None)
     assert s.telegram_max_input_chars == 1000
     assert s.agent_api_port == 8080
-    assert s.agent_timeout_s == 60
+    assert s.agent_timeout_s == 300
     assert s.allowed_statement_families == [StatementFamily.SELECT]
     assert s.metabase_allowed_database_ids == []
     assert s.code_graph_allowed_roots == []
