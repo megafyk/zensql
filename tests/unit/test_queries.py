@@ -47,10 +47,22 @@ def test_search_query_scopes_by_schema() -> None:
 
 def test_search_query_escapes_special_chars() -> None:
     sql = queries.build_search_query("a%b_c'd", 5)
-    assert "%" in sql.split("LIKE '")[1].split("%'")[0]  # raw % brackets still present
-    assert "\\%" in sql
-    assert "\\_" in sql
-    assert "''" in sql or "''" in sql  # single-quote escape
+    assert "LIKE '%a|%b|_c''d%' ESCAPE '|'" in sql
+
+
+def test_search_query_escapes_escape_char_and_backslash() -> None:
+    sql = queries.build_search_query("a|b\\c", 5)
+    assert "LIKE '%a||b\\\\c%' ESCAPE '|'" in sql
+
+
+def test_search_query_passes_chokepoint() -> None:
+    """The generated SQL must survive the sqlglot re-parse in
+    `_assert_information_schema_only` — a regression here breaks every
+    production search_tables call."""
+    from zen.schema_mcp.metabase_client import _assert_information_schema_only
+
+    for pattern in ("orders", "ord_50%", "a|b\\c'd"):
+        _assert_information_schema_only(queries.build_search_query(pattern, 20))
 
 
 @pytest.mark.parametrize("bad", ["a;b", "a b", "a' OR 1=1", "-- comment", "orders/*", "a.b"])

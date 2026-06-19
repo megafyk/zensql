@@ -49,6 +49,25 @@ def _run(
 
 
 @pytest.fixture(autouse=True)
+def _allowed_roots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Allow the fixture path used across these tests; the allowlist itself is
+    exercised by the path_not_allowed tests below."""
+    from pydantic import SecretStr
+
+    from zen.config.settings import Settings
+
+    monkeypatch.setattr(
+        cli,
+        "get_settings",
+        lambda: Settings(
+            _env_file=None,
+            agent_api_token=SecretStr("t"),
+            code_graph_allowed_roots=["/srv/repos"],
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _stub_crg(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli.crg_sync,
@@ -135,6 +154,65 @@ def test_register_no_graph_build_only_skips_build(tmp_path: Path) -> None:
         )
     assert sr.call_args.kwargs["skip"] is False
     assert sb.call_args.kwargs["skip"] is True
+
+
+def test_register_rejects_path_outside_allowed_roots(tmp_path: Path) -> None:
+    bad = _orders_entry_json()
+    bad["path"] = "/etc/something"
+    rc, _, err = _run(
+        ["--registry-path", str(tmp_path / "r.json"), "register"],
+        stdin_text=json.dumps(bad),
+    )
+    assert rc == 1
+    assert "path_not_allowed" in err
+
+
+def test_register_rejects_prefix_sibling_path(tmp_path: Path) -> None:
+    """/srv/repos-evil must not pass a /srv/repos allowlist — the check is
+    component-wise, not a string prefix."""
+    bad = _orders_entry_json()
+    bad["path"] = "/srv/repos-evil/x"
+    rc, _, err = _run(
+        ["--registry-path", str(tmp_path / "r.json"), "register"],
+        stdin_text=json.dumps(bad),
+    )
+    assert rc == 1
+    assert "path_not_allowed" in err
+
+
+def test_register_refuses_when_allowlist_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pydantic import SecretStr
+
+    from zen.config.settings import Settings
+
+    monkeypatch.setattr(
+        cli,
+        "get_settings",
+        lambda: Settings(_env_file=None, agent_api_token=SecretStr("t")),
+    )
+    rc, _, err = _run(
+        ["--registry-path", str(tmp_path / "r.json"), "register"],
+        stdin_text=json.dumps(_orders_entry_json()),
+    )
+    assert rc == 1
+    assert "path_not_allowed" in err
+    assert "CODE_GRAPH_ALLOWED_ROOTS" in err
+
+
+def test_update_rejects_path_outside_allowed_roots(tmp_path: Path) -> None:
+    registry = tmp_path / "r.json"
+    _run(
+        ["--registry-path", str(registry), "register"],
+        stdin_text=json.dumps(_orders_entry_json()),
+    )
+    rc, _, err = _run(
+        ["--registry-path", str(registry), "update", "orders-service"],
+        stdin_text=json.dumps({"path": "/etc/evil"}),
+    )
+    assert rc == 1
+    assert "path_not_allowed" in err
 
 
 def test_register_invalid_json(tmp_path: Path) -> None:

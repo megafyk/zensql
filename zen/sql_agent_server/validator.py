@@ -1,11 +1,15 @@
 """SQL safety validator.
 
 Post-generation gate. Runs in order:
-1. Denylist keyword pre-check (defense in depth — catches anything sqlglot
-   might miscategorize).
+1. Refuse MySQL executable comments (`/*! ... */` — MariaDB runs their
+   contents), then denylist keyword pre-check on text with string literals,
+   quoted identifiers, and comments stripped (defense in depth — catches
+   anything sqlglot might miscategorize, without false-positives on quoted
+   text).
 2. sqlglot parse (dialect="mysql"; MariaDB is mostly compatible).
 3. Exactly one statement.
-4. Statement family ∈ allowed_families (default {SELECT}).
+4. Statement family ∈ allowed_families (default {SELECT}; UNION/INTERSECT/
+   EXCEPT of SELECTs count as SELECT, with INTO refused on every leaf).
 5. Identifier verification against `retrieved_metadata` (strict → reject;
    non-strict → warn).
 6. Risk-pattern warnings: `SELECT *`, missing `LIMIT`, suspicious functions.
@@ -23,8 +27,10 @@ from sqlglot import exp
 from zen.models.metadata import TableMetadata
 from zen.models.safety import SafetyViolation
 
-# Map sqlglot expression types to family strings.
-_FAMILY_BY_TYPE: dict[type[exp.Expression], str] = {
+# Map sqlglot expression types to family strings. Set operations over SELECTs
+# (UNION/INTERSECT/EXCEPT) are read-only, so they count as the SELECT family;
+# the per-leaf INTO check below still refuses SELECT INTO in any arm.
+_FAMILY_BY_TYPE: dict[type[exp.Expr], str] = {
     exp.Select: "SELECT",
     exp.Insert: "INSERT",
     exp.Update: "UPDATE",
@@ -40,7 +46,9 @@ _FAMILY_BY_TYPE: dict[type[exp.Expression], str] = {
     exp.Command: "COMMAND",
     exp.Use: "USE",
     exp.Grant: "GRANT",
-    exp.Union: "UNION",
+    exp.Union: "SELECT",
+    exp.Intersect: "SELECT",
+    exp.Except: "SELECT",
 }
 
 # Denied keywords — matched word-bounded against the raw SQL text.
@@ -89,9 +97,44 @@ class ValidationReport:
     sql_with_banner: str | None = None
 
 
-def _strip_sql_comments(sql: str) -> str:
-    no_block = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
-    return re.sub(r"--[^\n]*", " ", no_block)
+# One left-to-right lexical scan over string literals, quoted identifiers, and
+# comments. Whichever construct opens first wins, so quotes inside comments and
+# comment markers inside strings don't confuse the keyword pre-check.
+# `--` only starts a MySQL comment when followed by whitespace or end-of-line
+# (`--x` is double minus) — mirroring that rule keeps this lexer from hiding
+# tokens the server would execute.
+_LEXICAL_NOISE_RE = re.compile(
+    r"""
+      '(?:[^'\\]|\\.|'')*'      # single-quoted string ('' and \' escapes)
+    | "(?:[^"\\]|\\.|"")*"      # double-quoted string
+    | `[^`]*(?:``[^`]*)*`       # backtick-quoted identifier
+    | /\*.*?\*/                 # block comment
+    | --(?=\s|$)[^\n]*          # -- line comment (MySQL requires whitespace)
+    | \#[^\n]*                  # MySQL \# line comment
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+# MySQL `/*!` and MariaDB `/*M!` executable comments. Matched against the RAW
+# text — deliberately also inside string literals — because no legitimate
+# read-only draft ever contains the marker, while any lexer-confusion trick
+# that hides one from a smarter scan would hand the human reviewer SQL that
+# MariaDB executes.
+_EXECUTABLE_COMMENT_RE = re.compile(r"/\*M?!", re.IGNORECASE)
+
+
+def _strip_literals_and_comments(sql: str) -> str:
+    return _LEXICAL_NOISE_RE.sub(" ", sql)
+
+
+def _find_executable_comment(sql: str) -> str | None:
+    """Return the start of the first `/*!`/`/*M!` executable-comment marker,
+    or None. MariaDB/MySQL execute their contents, so a 'safe' SELECT could
+    smuggle a payload past both the denylist and sqlglot."""
+    m = _EXECUTABLE_COMMENT_RE.search(sql)
+    if m is None:
+        return None
+    return sql[m.start() : m.start() + 120]
 
 
 def _banner(request_id: str | None, generated_at: str) -> str:
@@ -127,8 +170,19 @@ class SqlSafetyValidator:
         if not cleaned:
             return _fail(rep, "EMPTY_SQL", "empty SQL")
 
-        # 1. Denylist keyword pre-check on the comment-stripped raw text.
-        stripped = _strip_sql_comments(cleaned)
+        # 1. Denylist keyword pre-check, with string literals, quoted
+        # identifiers, and comments removed so e.g. `note = 'please update'`
+        # is not a false positive. Executable comments are refused outright
+        # because MariaDB runs their contents.
+        executable = _find_executable_comment(cleaned)
+        if executable:
+            return _fail(
+                rep,
+                "EXECUTABLE_COMMENT",
+                "executable comment (/*! or /*M!) not allowed",
+                evidence={"comment": executable[:120]},
+            )
+        stripped = _strip_literals_and_comments(cleaned)
         m = _DENIED_KEYWORDS_RE.search(stripped)
         if m:
             kw = m.group(0).upper()
@@ -148,15 +202,15 @@ class SqlSafetyValidator:
         except (sqlglot.errors.ParseError, ValueError) as e:
             return _fail(rep, "UNPARSEABLE", f"sqlglot parse error: {e}")
 
-        statements = [s for s in statements if s is not None]
-        if len(statements) != 1:
+        parsed: list[exp.Expr] = [s for s in statements if s is not None]
+        if len(parsed) != 1:
             return _fail(
                 rep,
                 "MULTI_STATEMENT",
-                f"exactly one statement permitted, got {len(statements)}",
+                f"exactly one statement permitted, got {len(parsed)}",
             )
 
-        stmt = statements[0]
+        stmt = parsed[0]
         family = _FAMILY_BY_TYPE.get(type(stmt))
         if family is None:
             family = type(stmt).__name__.upper()
@@ -168,13 +222,15 @@ class SqlSafetyValidator:
                 evidence={"family": family},
             )
 
-        # SELECT ... INTO @var / OUTFILE / DUMPFILE — refuse even though family is SELECT.
-        if isinstance(stmt, exp.Select) and stmt.args.get("into"):
-            return _fail(
-                rep,
-                "STATEMENT_FAMILY_DENIED",
-                "SELECT INTO not permitted",
-            )
+        # SELECT ... INTO @var / OUTFILE / DUMPFILE — refuse even though family
+        # is SELECT. Checked on every SELECT leaf so UNION arms are covered.
+        for sel in stmt.find_all(exp.Select):
+            if sel.args.get("into"):
+                return _fail(
+                    rep,
+                    "STATEMENT_FAMILY_DENIED",
+                    "SELECT INTO not permitted",
+                )
 
         # 3. Identifier verification.
         tables_seen: list[str] = []
@@ -187,7 +243,7 @@ class SqlSafetyValidator:
 
             unknown_tables: list[str] = []
             unknown_columns: list[str] = []
-            referenced_columns: list[tuple[exp.Column, TableMetadata]] = []
+            matched_by_name: dict[str, TableMetadata] = {}
 
             for table_ref in stmt.find_all(exp.Table):
                 schema = table_ref.db or ""
@@ -200,19 +256,27 @@ class SqlSafetyValidator:
                     unknown_tables.append(f"{schema + '.' if schema else ''}{name}")
                 else:
                     tables_seen.append(f"{matched.schema_}.{matched.name}")
-                    for col in stmt.find_all(exp.Column):
-                        if col.table and col.table != name:
-                            continue
-                        if col.name == "*":
-                            continue
-                        referenced_columns.append((col, matched))
+                    matched_by_name[matched.name] = matched
 
-            # If multiple tables present and a column isn't qualified, we skip
-            # validation for it (sqlglot doesn't bind columns to tables for us).
-            for col, t in referenced_columns:
-                col_names = {c.name for c in t.columns}
-                if col.name not in col_names:
-                    unknown_columns.append(f"{t.name}.{col.name}")
+            # Columns qualified with a real table name are checked against that
+            # table. Unqualified columns are checked only when exactly one known
+            # table is in play (sqlglot doesn't bind columns to tables for us);
+            # with multiple tables — or an alias qualifier — they are skipped.
+            sole_table = (
+                next(iter(matched_by_name.values()))
+                if len(matched_by_name) == 1 and not unknown_tables
+                else None
+            )
+            for col in stmt.find_all(exp.Column):
+                if col.name == "*":
+                    continue
+                target = matched_by_name.get(col.table) if col.table else sole_table
+                if target is None:
+                    continue
+                if col.name not in {c.name for c in target.columns}:
+                    ref = f"{target.name}.{col.name}"
+                    if ref not in unknown_columns:
+                        unknown_columns.append(ref)
 
             if unknown_tables:
                 rep.warnings.append(
@@ -237,11 +301,22 @@ class SqlSafetyValidator:
                         evidence={"columns": unknown_columns},
                     )
 
-        # 4. Risk-pattern warnings.
-        if any(isinstance(s, exp.Star) for s in stmt.find_all(exp.Star)):
+        # 4. Risk-pattern warnings. Only select-list stars count — COUNT(*)
+        # and other aggregate stars are not a SELECT *.
+        if any(
+            isinstance(e, exp.Star)
+            or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))
+            for sel in stmt.find_all(exp.Select)
+            for e in sel.expressions
+        ):
             rep.warnings.append("SELECT * detected — prefer explicit column lists")
 
-        if isinstance(stmt, exp.Select) and not stmt.args.get("limit"):
+        has_limit = bool(stmt.args.get("limit")) or (
+            # A set operation is bounded when every arm carries its own LIMIT.
+            isinstance(stmt, exp.SetOperation)
+            and all(sel.args.get("limit") for sel in stmt.find_all(exp.Select))
+        )
+        if isinstance(stmt, (exp.Select, exp.SetOperation)) and not has_limit:
             rep.warnings.append(
                 "no LIMIT clause — query may return a very large result set"
             )

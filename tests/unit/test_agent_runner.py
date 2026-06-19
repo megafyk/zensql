@@ -13,9 +13,17 @@ class _RecExec:
     def __init__(self, results: list[AgentRunResult]) -> None:
         self.results = list(results)
         self.cmds: list[list[str]] = []
+        self.stdin_inputs: list[bytes | None] = []
 
-    async def __call__(self, cmd: list[str], timeout_s: float) -> AgentRunResult:
+    async def __call__(
+        self,
+        cmd: list[str],
+        timeout_s: float,
+        *,
+        stdin_input: bytes | None = None,
+    ) -> AgentRunResult:
         self.cmds.append(cmd)
+        self.stdin_inputs.append(stdin_input)
         return self.results.pop(0)
 
 
@@ -84,6 +92,44 @@ async def test_runner_does_not_flip_on_non_session_error() -> None:
     res = await _run(r)
     assert len(rec.cmds) == 1  # no retry for unrelated failures
     assert res.exit_code == 1
+
+
+async def test_runner_passes_prompt_via_stdin_not_argv() -> None:
+    """The raw user text must not sit in /proc/<pid>/cmdline for the run."""
+    r, rec = _runner([AgentRunResult(stdout="ok", stderr="", exit_code=0)], resume_exists=False)
+    await _run(r)
+    assert rec.stdin_inputs == [b"u"]
+    assert "u" not in rec.cmds[0]
+
+
+async def test_runner_retry_resends_prompt_on_stdin() -> None:
+    r, rec = _runner(
+        [
+            AgentRunResult(stdout="", stderr="Session ID SID is already in use.", exit_code=1),
+            AgentRunResult(stdout="ok", stderr="", exit_code=0),
+        ],
+        resume_exists=False,
+    )
+    await _run(r)
+    assert rec.stdin_inputs == [b"u", b"u"]
+
+
+async def test_exec_kills_subprocess_on_cancellation(tmp_path) -> None:
+    """uvicorn cancels in-flight request tasks on shutdown — the spawned
+    process must die with them, not keep running orphaned."""
+    import asyncio
+
+    marker = tmp_path / "survived"
+    r = ClaudeCodeRunner(project_dir=str(tmp_path))
+    task = asyncio.create_task(
+        r._exec(["bash", "-c", f"sleep 1 && touch {marker}"], timeout_s=30)
+    )
+    await asyncio.sleep(0.2)  # let the subprocess start
+    task.cancel()
+    with __import__("pytest").raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(1.2)  # past the would-be touch
+    assert not marker.exists()
 
 
 def test_subscription_env_strips_auth_and_nesting_vars() -> None:

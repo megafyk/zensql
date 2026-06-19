@@ -7,6 +7,8 @@ will replace the current passthrough that just prepends the banner.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -15,7 +17,7 @@ from zen.config.settings import Settings
 from zen.models.requests import UserSqlRequest
 from zen.models.responses import GeneratedSqlResponse
 from zen.registry.store import RegistryError, RegistryStore
-from zen.sql_agent_server.agent_runner import AgentRunnerProtocol
+from zen.sql_agent_server.agent_runner import AgentRunnerProtocol, AgentRunResult
 from zen.sql_agent_server.audit import AuditLogger, NullAuditLogger, redact_sql, redact_text
 from zen.sql_agent_server.intent_guard import reject_if_unsafe_intent
 from zen.sql_agent_server.prompts import (
@@ -40,6 +42,8 @@ _DEFAULT_ALLOWED_TOOLS = [
 
 _SQL_BLOCK_RE = re.compile(r"```sql\s*\n(.+?)\n```", re.DOTALL | re.IGNORECASE)
 _CHAT_BLOCK_RE = re.compile(r"```chat\s*\n(.+?)\n```", re.DOTALL | re.IGNORECASE)
+
+logger = logging.getLogger(__name__)
 
 
 def parse_agent_output(output: str) -> tuple[str, str]:
@@ -79,14 +83,17 @@ class Orchestrator:
         self._allowed_tools = allowed_tools or _DEFAULT_ALLOWED_TOOLS
         self._validator = validator or SqlSafetyValidator(
             allowed_families={f.value for f in settings.allowed_statement_families},
-            strict_identifier_check=settings.strict_identifier_check,
         )
         self._audit = audit or NullAuditLogger()
 
     def _load_repos(self) -> list[RepoEntry]:
         try:
             return self._registry.list_repos()
-        except RegistryError:
+        except RegistryError as e:
+            # Degrade gracefully (chat replies need no registry), but tell the
+            # operator — without registered sources the agent guesses database
+            # ids and gives up, surfacing only as a confusing NO_SQL_PRODUCED.
+            logger.warning("registry unavailable, continuing without sources: %s", e)
             return []
 
     def _registered_sources(self) -> str:
@@ -123,12 +130,16 @@ class Orchestrator:
 
         violation = reject_if_unsafe_intent(request.text)
         if violation is not None:
+            # The matched span is raw user text and can contain a literal
+            # credential (the EXFILTRATION rule fires on exactly that) — log
+            # only a hash + length, never the match itself.
+            matched = str(violation.evidence.get("match", ""))
             self._audit.log(
                 "unsafe_intent_rejected",
                 request_id=request.request_id,
                 job_id=job_id,
                 severity="warn",
-                details={"rule": violation.rule, "evidence": violation.evidence},
+                details={"rule": violation.rule, "evidence": redact_sql(matched)},
             )
             return GeneratedSqlResponse(
                 request_id=request.request_id,
@@ -148,7 +159,7 @@ class Orchestrator:
             details={"timeout_s": self._settings.agent_timeout_s, "session_id": session_id},
         )
 
-        async def _run():
+        async def _run() -> AgentRunResult:
             return await self._runner.run(
                 system_prompt=build_system_prompt(),
                 user_prompt=build_user_prompt(request, self._registered_sources()),
@@ -158,13 +169,58 @@ class Orchestrator:
                 session_id=session_id,
             )
 
-        if session_id is not None:
-            # Serialize same-user requests: concurrent --resume corrupts the
-            # session transcript.
-            async with self._user_locks.get(request.user_id):
+        try:
+            if session_id is not None:
+                # Serialize same-user requests: concurrent --resume corrupts
+                # the session transcript. The wait is bounded to one full agent
+                # run — beyond that the bot's HTTP timeout would drop the
+                # response anyway, so answer BUSY instead of queueing blindly.
+                lock = self._user_locks.get(request.user_id)
+                try:
+                    await asyncio.wait_for(
+                        lock.acquire(), timeout=float(self._settings.agent_timeout_s)
+                    )
+                except TimeoutError:
+                    self._audit.log(
+                        "user_busy",
+                        request_id=request.request_id,
+                        job_id=job_id,
+                        severity="warn",
+                        details={"user_id": request.user_id},
+                    )
+                    return GeneratedSqlResponse(
+                        request_id=request.request_id,
+                        job_id=job_id,
+                        error_code="BUSY",
+                        error_message=(
+                            "a previous request for this user is still being "
+                            "processed — please retry shortly"
+                        ),
+                        warnings=[],
+                    )
+                try:
+                    result = await _run()
+                finally:
+                    lock.release()
+            else:
                 result = await _run()
-        else:
-            result = await _run()
+        except OSError as e:
+            # claude binary missing, bad project dir, … — keep the audit trail
+            # terminal and the error envelope structured instead of a raw 500.
+            self._audit.log(
+                "upstream_error",
+                request_id=request.request_id,
+                job_id=job_id,
+                severity="error",
+                details={"reason": "spawn_failed", "error": f"{e.__class__.__name__}: {e}"},
+            )
+            return GeneratedSqlResponse(
+                request_id=request.request_id,
+                job_id=job_id,
+                error_code="AGENT_FAILED",
+                error_message=f"failed to launch agent: {e}",
+                warnings=[],
+            )
 
         if result.timed_out:
             self._audit.log(
@@ -193,8 +249,9 @@ class Orchestrator:
                 details={
                     "reason": "non_zero_exit",
                     "exit_code": result.exit_code,
-                    "stderr": (result.stderr or "")[:500],
-                    "stdout": (result.stdout or "")[:500],
+                    # Agent output can echo the user's text — hash + preview only.
+                    "stderr": redact_text(result.stderr or ""),
+                    "stdout": redact_text(result.stdout or ""),
                 },
             )
             msg = f"agent exited with code {result.exit_code}"
@@ -239,7 +296,7 @@ class Orchestrator:
                 request_id=request.request_id,
                 job_id=job_id,
                 severity="warn",
-                details={"reason": "no_sql_block", "stdout": agent_message[:500]},
+                details={"reason": "no_sql_block", "stdout": redact_text(agent_message)},
             )
             # Relay the agent's own words: it usually explains why (a clarifying
             # question, an out-of-schema table, etc.) — far more useful than a

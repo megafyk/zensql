@@ -262,3 +262,82 @@ async def test_process_message_surfaces_transport_error() -> None:
     out = await process_message("anything", "tg:1", _settings(), fake)
     assert "Upstream error" in out
     assert "ConnectError" in out
+
+
+# ---------------------------------------------------------------------------
+# split_reply
+# ---------------------------------------------------------------------------
+
+
+def test_split_reply_short_message_unchanged() -> None:
+    from zen.telegram_bot.handlers import split_reply
+
+    assert split_reply("hello") == ["hello"]
+
+
+def test_split_reply_long_sql_chunks_stay_valid_html() -> None:
+    from zen.telegram_bot.handlers import (
+        TELEGRAM_MAX_MESSAGE_CHARS,
+        format_reply,
+        split_reply,
+    )
+
+    sql = "\n".join(f"SELECT col_{i} FROM big_table WHERE x = {i}" for i in range(300))
+    resp = _stub_response(sql=sql)
+    reply = format_reply(resp)
+    chunks = split_reply(reply)
+
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert len(chunk) <= TELEGRAM_MAX_MESSAGE_CHARS
+        # every chunk balances its <pre><code> tags
+        assert chunk.count('<pre><code class="language-sql">') == chunk.count(
+            "</code></pre>"
+        )
+    # no SQL line is lost across the split
+    joined = "".join(chunks)
+    assert "col_0 " in joined and "col_299 " in joined
+
+
+def test_split_reply_handles_monster_single_line() -> None:
+    from zen.telegram_bot.handlers import TELEGRAM_MAX_MESSAGE_CHARS, split_reply
+
+    chunks = split_reply("x" * 10000)
+    assert all(len(c) <= TELEGRAM_MAX_MESSAGE_CHARS for c in chunks)
+    assert sum(len(c) for c in chunks) == 10000
+
+
+def test_split_reply_long_single_line_sql_stays_valid_html() -> None:
+    """A single over-width SQL line (e.g. a giant IN-list) — escaped quotes
+    become &#x27; entities and the line ends in </code></pre>. No chunk may
+    bisect a tag or an entity, and tags must stay balanced."""
+    from zen.telegram_bot.handlers import (
+        TELEGRAM_MAX_MESSAGE_CHARS,
+        format_reply,
+        split_reply,
+    )
+
+    ids = ", ".join(f"'ORD-{i:05d}'" for i in range(1200))
+    sql = f"SELECT * FROM orders WHERE code IN ({ids})"
+    chunks = split_reply(format_reply(_stub_response(sql=sql)))
+
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert len(chunk) <= TELEGRAM_MAX_MESSAGE_CHARS
+        assert chunk.count('<pre><code class="language-sql">') == chunk.count(
+            "</code></pre>"
+        )
+        tail = chunk.rsplit("&", 1)
+        if len(tail) == 2 and "<" not in tail[1]:
+            assert ";" in tail[1], f"entity bisected at chunk tail: ...{tail[1]!r}"
+
+
+def test_split_reply_line_ending_in_close_tag_inside_pre() -> None:
+    from zen.telegram_bot.handlers import _PRE_CLOSE, _PRE_OPEN, split_reply
+
+    width = 3900 - len(_PRE_OPEN) - len(_PRE_CLOSE) - 2
+    reply = _PRE_OPEN + "SELECT 1\n" + "y" * (width - 4) + _PRE_CLOSE + "\nexplanation"
+    chunks = split_reply(reply)
+    for chunk in chunks:
+        assert chunk.count(_PRE_OPEN) == chunk.count(_PRE_CLOSE)
+        assert "</code<" not in chunk

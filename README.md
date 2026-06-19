@@ -42,8 +42,9 @@ Optional:
 
 - `AGENT_API_HOST` / `AGENT_API_PORT` — server bind. Default `0.0.0.0:8080`.
 - `AGENT_API_BASE_URL` — what the Telegram bot uses to call the server. Default `http://127.0.0.1:8080`.
-- `AGENT_TIMEOUT_S` — how long the orchestrator waits for a Claude Code subprocess. Default 60s.
-- `ALLOWED_STATEMENT_FAMILIES` — default `SELECT`. Add `EXPLAIN`/`SHOW` only if you know why.
+- `AGENT_TIMEOUT_S` — how long the orchestrator waits for a Claude Code subprocess. Default 300s (5 min).
+- `ALLOWED_STATEMENT_FAMILIES` — `SELECT` is the only supported family today (UNION/INTERSECT/EXCEPT of SELECTs count as SELECT).
+- `METABASE_API_KEY` — optional; when set, the Schema MCP authenticates via `X-API-KEY` instead of username/password session login.
 - `REGISTRY_PATH` — where `registry.json` lives. Default `.claude/skills/sql_add_repo/registry.json`.
 - `AUDIT_LOG_DIR` — JSONL audit destination. Default `var/audit`.
 
@@ -163,7 +164,7 @@ The bot can't reach the SQL agent server. Check `AGENT_API_BASE_URL` (default `h
 The intent guard caught a pattern in the user's message (e.g. `delete from`, `run this sql`, `ignore previous instructions`). That's working as intended — there's no override.
 
 **Generated SQL is `error_code: VALIDATION_FAILED`**
-The agent produced SQL the validator refused (denied family, multi-statement, unknown identifier in strict mode). Check the `warnings` array in the response for which rule fired.
+The agent produced SQL the validator refused (denied family, multi-statement, executable `/*! ... */` comment). Check the `warnings` array in the response for which rule fired. Identifier verification against schema metadata happens inside the agent loop (via the Schema MCP tools), not in the server-side validator.
 
 ## Project layout
 

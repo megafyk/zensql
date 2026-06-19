@@ -7,6 +7,7 @@ on the `claude` CLI); tests use `FakeAgentRunner`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -80,25 +81,33 @@ class ClaudeCodeRunner:
         timeout_s: float,
         session_id: str | None = None,
     ) -> AgentRunResult:
+        # The user prompt goes over stdin, not argv: argv is world-readable in
+        # /proc/<pid>/cmdline for the multi-minute run, and the prompt carries
+        # raw user text the rest of the system keeps out of even the audit log.
+        # `claude -p` with no positional prompt reads it from stdin.
+        # --mcp-config is absolutized against the server's cwd so a different
+        # claude_code_project_dir can't silently point it at another file.
         cmd = [
             self._bin,
             "-p",
-            user_prompt,
             "--append-system-prompt",
             system_prompt,
             "--mcp-config",
-            mcp_config_path,
+            os.path.abspath(mcp_config_path),
             "--allowedTools",
             ",".join(allowed_tools),
             "--output-format",
             "text",
         ]
+        prompt = user_prompt.encode("utf-8")
         if session_id is None:
-            return await self._exec(cmd, timeout_s)
+            return await self._exec(cmd, timeout_s, stdin_input=prompt)
 
         # Resume the user's session if its transcript exists, else create it.
         resume = self._resume_exists(session_id)
-        result = await self._exec(cmd + self._session_flag(session_id, resume), timeout_s)
+        result = await self._exec(
+            cmd + self._session_flag(session_id, resume), timeout_s, stdin_input=prompt
+        )
         # If the guess disagreed with disk (cleanup, race, or a session created
         # elsewhere), the CLI says so — flip the mode once and retry.
         if (
@@ -107,7 +116,9 @@ class ClaudeCodeRunner:
             and is_session_state_error(result.stderr or result.stdout or "")
         ):
             result = await self._exec(
-                cmd + self._session_flag(session_id, not resume), timeout_s
+                cmd + self._session_flag(session_id, not resume),
+                timeout_s,
+                stdin_input=prompt,
             )
         return result
 
@@ -118,22 +129,37 @@ class ClaudeCodeRunner:
     def _resume_exists(self, session_id: str) -> bool:
         return session_file(self._project_dir, session_id).exists()
 
-    async def _exec(self, cmd: list[str], timeout_s: float) -> AgentRunResult:
+    async def _exec(
+        self,
+        cmd: list[str],
+        timeout_s: float,
+        *,
+        stdin_input: bytes | None = None,
+    ) -> AgentRunResult:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=self._project_dir,
             env=subscription_env(),
+            stdin=asyncio.subprocess.PIPE if stdin_input is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout_s
+                proc.communicate(stdin_input), timeout=timeout_s
             )
         except TimeoutError:
             proc.kill()
             await proc.wait()
             return AgentRunResult(stdout="", stderr="", exit_code=-1, timed_out=True)
+        finally:
+            # Task cancellation (uvicorn shutdown, client disconnect) must not
+            # orphan a multi-minute `claude` run that keeps writing the user's
+            # session transcript.
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
         return AgentRunResult(
             stdout=stdout.decode("utf-8", errors="replace"),
             stderr=stderr.decode("utf-8", errors="replace"),

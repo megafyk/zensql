@@ -38,7 +38,6 @@ class Settings(BaseSettings):
     allowed_statement_families: Annotated[list[StatementFamily], NoDecode] = Field(
         default_factory=lambda: [StatementFamily.SELECT]
     )
-    strict_identifier_check: bool = Field(default=True)
 
     claude_code_bin: str = Field(default="claude")
     claude_code_project_dir: str = Field(default="")
@@ -49,24 +48,16 @@ class Settings(BaseSettings):
     metabase_base_url: str = Field(default="")
     metabase_username: SecretStr = Field(default=SecretStr(""))
     metabase_password: SecretStr = Field(default=SecretStr(""))
+    # When set, the Schema MCP authenticates via X-API-KEY (stateless) instead
+    # of username/password session login.
     metabase_api_key: SecretStr = Field(default=SecretStr(""))
-    metabase_allowed_database_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
     metabase_query_timeout_s: int = Field(default=15, ge=1, le=120)
 
     registry_path: str = Field(default=".claude/skills/sql_add_repo/registry.json")
-    code_graph_registry_path: str = Field(default="~/.code-review-graph/registry.json")
     code_graph_allowed_roots: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    code_graph_snippet_max: int = Field(default=400, ge=1, le=5000)
 
     audit_log_dir: str = Field(default="var/audit")
     log_level: str = Field(default="INFO")
-
-    @field_validator("metabase_allowed_database_ids", mode="before")
-    @classmethod
-    def _parse_db_ids(cls, v: Any) -> Any:
-        if isinstance(v, str):
-            return [int(x.strip()) for x in v.split(",") if x.strip()]
-        return v
 
     @field_validator("allowed_statement_families", mode="before")
     @classmethod

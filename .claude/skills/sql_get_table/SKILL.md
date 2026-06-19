@@ -90,10 +90,17 @@ Surface that to the user verbatim, or paraphrase as
 - `DATABASE_NOT_ALLOWED` — the database id isn't in any registered repo's
   metabase sources. Tell the user to register a repo first via the
   `sql_add_repo` skill.
-- `MetabaseAuthFailedError` — Metabase session creds wrong. Stop; tell the
-  user to check `METABASE_USERNAME` / `METABASE_PASSWORD`.
-- Empty `tables` list in response — the requested tables don't exist in this
-  database. Confirm with the user; don't fabricate columns.
+- `MetabaseAuthFailedError` — Metabase auth failed. Stop; tell the user to
+  check `METABASE_USERNAME` / `METABASE_PASSWORD`, or `METABASE_API_KEY` if the
+  deployment uses API-key auth.
+- `METABASE_QUERY_FAILED` — Metabase accepted the request but the metadata
+  query itself failed (SQL/permission error, warehouse outage). This is **not**
+  "table doesn't exist" — surface the error and retry/escalate; don't fabricate.
+- `ValueError: schema_names is required` — you omitted `schema_names` and the
+  registered source declares no schema. Pass `schema_names` explicitly (or have
+  the user add a `schema` to the registry entry).
+- Empty `tables` list in response — the requested tables don't exist in the
+  queried schema. Confirm with the user; don't fabricate columns.
 
 ## Hard rules
 

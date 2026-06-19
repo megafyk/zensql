@@ -50,7 +50,7 @@ For **register** / **update**, gather these fields (one at a time via
 |---|---|---|
 | `name` | string | Lowercase, kebab- or snake_case, unique. Pattern `^[a-z0-9][a-z0-9_-]{0,63}$`. |
 | `description` | string | Short purpose summary. |
-| `path` | string | **Absolute** filesystem path (`/...`). Verify it exists before submitting. |
+| `path` | string | **Absolute** filesystem path (`/...`). Verify it exists **and** lives under one of `CODE_GRAPH_ALLOWED_ROOTS` — the CLI refuses paths outside those roots, and refuses every registration when the variable is unset. |
 | `tags` | list[string] | At least one. Domain categorization (lowercase kebab-case recommended). |
 | `connection` | list | At least one `{environment, sources[]}` block. |
 
@@ -108,6 +108,11 @@ zensql-only operation; warn the user that semantic search via
 - Never write `registry.json` directly. Always go through the CLI — it owns
   schema validation, atomic save, and CRG sync.
 - Never register a `path` that doesn't exist on disk.
+- The `path` must resolve under a `CODE_GRAPH_ALLOWED_ROOTS` entry; the CLI
+  returns `path_not_allowed` (exit 1) for anything outside, and for **all**
+  paths when `CODE_GRAPH_ALLOWED_ROOTS` is empty. Check this before collecting
+  the rest of the entry (saves a roundtrip), and tell the user to set the env
+  var if it's unset.
 - Reject names that don't match `^[a-z0-9][a-z0-9_-]{0,63}$` before sending to
   the CLI (the CLI will reject them anyway; saves a roundtrip).
 - A registered repo's `metabase.database_id` enters the Schema MCP allowlist.

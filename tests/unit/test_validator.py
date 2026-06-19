@@ -110,6 +110,100 @@ def test_select_into_var_rejected() -> None:
     assert "STATEMENT_FAMILY_DENIED" in rules
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT id FROM orders WHERE note = 'please update the ticket' LIMIT 1",
+        "SELECT id FROM orders WHERE note LIKE '%create%' LIMIT 1",
+        'SELECT id FROM orders WHERE note = "drop it" LIMIT 1',
+        "SELECT `delete` FROM orders LIMIT 1",
+        "SELECT id FROM orders WHERE note = '-- drop table x' LIMIT 1",
+    ],
+)
+def test_denied_keyword_inside_literal_or_quoted_identifier_passes(sql: str) -> None:
+    v = SqlSafetyValidator(strict_identifier_check=False)
+    rep = v.validate(sql)
+    assert rep.ok, rep.summary
+
+
+def test_union_of_selects_passes() -> None:
+    v = SqlSafetyValidator(strict_identifier_check=False)
+    rep = v.validate(
+        "SELECT id FROM orders UNION ALL SELECT id FROM customers LIMIT 10"
+    )
+    assert rep.ok, rep.summary
+    assert set(rep.tables_referenced) == {"orders", "customers"}
+
+
+def test_union_with_per_arm_limits_no_limit_warning() -> None:
+    v = SqlSafetyValidator(strict_identifier_check=False)
+    rep = v.validate(
+        "(SELECT id FROM orders LIMIT 5) UNION (SELECT id FROM customers LIMIT 5)"
+    )
+    assert rep.ok, rep.summary
+    assert not any("LIMIT" in w for w in rep.warnings)
+
+
+def test_union_without_any_limit_warns() -> None:
+    v = SqlSafetyValidator(strict_identifier_check=False)
+    rep = v.validate("SELECT id FROM orders UNION SELECT id FROM customers")
+    assert rep.ok
+    assert any("LIMIT" in w for w in rep.warnings)
+
+
+def test_executable_comment_rejected() -> None:
+    v = SqlSafetyValidator()
+    rep = v.validate("SELECT id FROM orders /*! WHERE 1=1 */ LIMIT 1")
+    assert rep.ok is False
+    assert any(viol.rule == "EXECUTABLE_COMMENT" for viol in rep.violations)
+
+
+def test_versioned_executable_comment_rejected() -> None:
+    v = SqlSafetyValidator()
+    rep = v.validate("SELECT 1 /*!50000 UNION SELECT secret FROM creds*/ LIMIT 1")
+    assert rep.ok is False
+    assert any(viol.rule == "EXECUTABLE_COMMENT" for viol in rep.violations)
+
+
+def test_mariadb_executable_comment_rejected() -> None:
+    """MariaDB executes /*M! ... */ — must be refused like MySQL's /*!."""
+    v = SqlSafetyValidator()
+    rep = v.validate("SELECT 1 /*M!100000 UNION SELECT secret FROM creds*/ LIMIT 1")
+    assert rep.ok is False
+    assert any(viol.rule == "EXECUTABLE_COMMENT" for viol in rep.violations)
+
+
+def test_executable_comment_hidden_in_literal_still_rejected() -> None:
+    """A backslash-laden literal can confuse a lexer into hiding the marker —
+    the executable-comment scan runs on the raw text so it can't be smuggled."""
+    v = SqlSafetyValidator()
+    rep = v.validate(r"SELECT '\' /*!50000 DROP TABLE t */ '' LIMIT 1")
+    assert rep.ok is False
+    assert any(viol.rule == "EXECUTABLE_COMMENT" for viol in rep.violations)
+
+
+def test_double_dash_without_space_is_not_a_comment() -> None:
+    """`--x` is double-minus, not a comment — a denied keyword after it must
+    not be hidden by treating the rest of the line as a comment."""
+    v = SqlSafetyValidator()
+    rep = v.validate("SELECT 1 FROM orders WHERE n = 5 --DROP TABLE x\nLIMIT 1")
+    # The DROP keyword is live text (no space after --), so the denylist fires.
+    assert rep.ok is False
+    assert any(viol.rule == "STATEMENT_FAMILY_DENIED" for viol in rep.violations)
+
+
+def test_plain_block_comment_still_passes() -> None:
+    v = SqlSafetyValidator(strict_identifier_check=False)
+    rep = v.validate("SELECT id FROM orders /* note */ LIMIT 1")
+    assert rep.ok, rep.summary
+
+
+def test_hash_comment_with_keyword_passes() -> None:
+    v = SqlSafetyValidator(strict_identifier_check=False)
+    rep = v.validate("SELECT id FROM orders LIMIT 1 # drop")
+    assert rep.ok, rep.summary
+
+
 # ---------------------------------------------------------------------------
 # Multi-statement & parsing
 # ---------------------------------------------------------------------------
@@ -169,6 +263,29 @@ def test_strict_rejects_unknown_column() -> None:
     assert any(viol.rule == "IDENTIFIER_NOT_VERIFIED" for viol in rep.violations)
 
 
+def test_strict_skips_unqualified_columns_in_joins() -> None:
+    """With multiple tables sqlglot can't bind unqualified columns, so they
+    must be skipped instead of validated against every joined table."""
+    v = SqlSafetyValidator(strict_identifier_check=True)
+    rep = v.validate(
+        "SELECT status FROM orders JOIN customers ON customers.id = orders.customer_id"
+        " LIMIT 1",
+        _orders_metadata(),
+    )
+    assert rep.ok, rep.summary
+
+
+def test_strict_rejects_unknown_qualified_column_in_join() -> None:
+    v = SqlSafetyValidator(strict_identifier_check=True)
+    rep = v.validate(
+        "SELECT orders.no_such FROM orders JOIN customers"
+        " ON customers.id = orders.customer_id LIMIT 1",
+        _orders_metadata(),
+    )
+    assert rep.ok is False
+    assert any(viol.rule == "IDENTIFIER_NOT_VERIFIED" for viol in rep.violations)
+
+
 # ---------------------------------------------------------------------------
 # Risk warnings
 # ---------------------------------------------------------------------------
@@ -177,6 +294,20 @@ def test_strict_rejects_unknown_column() -> None:
 def test_select_star_warns() -> None:
     v = SqlSafetyValidator(strict_identifier_check=False)
     rep = v.validate("SELECT * FROM orders LIMIT 1")
+    assert rep.ok
+    assert any("SELECT *" in w for w in rep.warnings)
+
+
+def test_count_star_does_not_warn() -> None:
+    v = SqlSafetyValidator(strict_identifier_check=False)
+    rep = v.validate("SELECT COUNT(*) FROM orders LIMIT 1")
+    assert rep.ok
+    assert not any("SELECT *" in w for w in rep.warnings)
+
+
+def test_qualified_star_warns() -> None:
+    v = SqlSafetyValidator(strict_identifier_check=False)
+    rep = v.validate("SELECT o.* FROM orders o LIMIT 1")
     assert rep.ok
     assert any("SELECT *" in w for w in rep.warnings)
 

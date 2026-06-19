@@ -336,6 +336,75 @@ async def test_orchestrator_serializes_same_user_not_different() -> None:
     assert diff.max_active == 2  # different users -> independent locks
 
 
+async def test_orchestrator_unsafe_intent_evidence_is_redacted(tmp_path) -> None:
+    """The matched span can contain a literal credential ('password: hunter2'
+    is exactly what the EXFILTRATION rule fires on) — the audit log must only
+    hold a hash, never the raw match."""
+    import json
+
+    audit = AuditLogger(tmp_path)
+    orch = Orchestrator(_settings(), FakeAgentRunner(), audit=audit)
+    resp = await orch.run(_req("the password: hunter2 should work"))
+    assert resp.error_code == "UNSAFE_INTENT"
+    events = [
+        json.loads(line) for line in audit.daily_path().read_text().splitlines()
+    ]
+    rejected = next(e for e in events if e["event_type"] == "unsafe_intent_rejected")
+    assert "hunter2" not in json.dumps(rejected)
+    assert "sha256" in rejected["details"]["evidence"]
+
+
+async def test_orchestrator_agent_stdout_redacted_in_audit(tmp_path) -> None:
+    audit = AuditLogger(tmp_path)
+    runner = FakeAgentRunner(exit_code=1, stdout="leak: the-user-text-echoed-back")
+    orch = Orchestrator(_settings(), runner, audit=audit)
+    await orch.run(_req())
+    contents = audit.daily_path().read_text()
+    assert "the-user-text-echoed-back" not in contents
+
+
+async def test_orchestrator_spawn_failure_returns_agent_failed(tmp_path) -> None:
+    class _BrokenRunner:
+        async def run(self, **_: object):
+            raise FileNotFoundError("claude not found on PATH")
+
+    audit = AuditLogger(tmp_path)
+    orch = Orchestrator(_settings(), _BrokenRunner(), audit=audit)
+    resp = await orch.run(_req())
+    assert resp.error_code == "AGENT_FAILED"
+    assert "claude not found" in (resp.error_message or "")
+    types = [
+        __import__("json").loads(line)["event_type"]
+        for line in audit.daily_path().read_text().splitlines()
+    ]
+    # The audit trail stays terminal: started -> upstream_error.
+    assert types[-1] == "upstream_error"
+
+
+async def test_orchestrator_busy_when_user_lock_held() -> None:
+    import asyncio
+
+    from zen.sql_agent_server.session import UserLocks
+
+    locks = UserLocks()
+    s = Settings(
+        _env_file=None,
+        agent_api_token=SecretStr("t"),
+        agent_timeout_s=1,
+        mcp_config_path=".mcp.json",
+    )
+    runner = FakeAgentRunner(stdout="```sql\nSELECT 1 LIMIT 1;\n```")
+    orch = Orchestrator(s, runner, user_locks=locks)
+    req = _req()
+    await locks.get(req.user_id).acquire()  # simulate an in-flight request
+    try:
+        resp = await asyncio.wait_for(orch.run(req), timeout=5)
+    finally:
+        locks.get(req.user_id).release()
+    assert resp.error_code == "BUSY"
+    assert runner.calls == []
+
+
 async def test_orchestrator_nonzero_exit() -> None:
     runner = FakeAgentRunner(exit_code=2, stderr="boom")
     orch = Orchestrator(_settings(), runner)

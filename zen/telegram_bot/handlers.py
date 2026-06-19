@@ -41,6 +41,82 @@ _ACK = {
 }
 
 
+# Telegram rejects messages longer than 4096 chars; keep headroom for the
+# closing/reopening <pre> tags added at split boundaries.
+TELEGRAM_MAX_MESSAGE_CHARS = 4096
+_SPLIT_LIMIT = 3900
+_PRE_OPEN = '<pre><code class="language-sql">'
+_PRE_CLOSE = "</code></pre>"
+
+
+def _pre_state(line: str, in_pre: bool) -> bool:
+    if _PRE_OPEN in line and _PRE_CLOSE in line:
+        return in_pre
+    if _PRE_OPEN in line:
+        return True
+    if _PRE_CLOSE in line:
+        return False
+    return in_pre
+
+
+def _safe_slices(text: str, width: int) -> list[str]:
+    """Slice `text` into <=width pieces, backing each cut off so it never
+    lands inside an HTML entity (`&...;` — html.escape emits up to 6 chars)."""
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        j = min(i + width, len(text))
+        if j < len(text):
+            amp = text.rfind("&", max(i, j - 8), j)
+            if amp > i and ";" not in text[amp:j]:
+                j = amp
+        out.append(text[i:j])
+        i = j
+    return out
+
+
+def split_reply(reply: str, limit: int = _SPLIT_LIMIT) -> list[str]:
+    """Split an HTML reply into Telegram-sized chunks. A split inside the SQL
+    <pre><code> block closes the tags on the outgoing chunk and reopens them
+    on the next so every chunk renders as valid HTML."""
+    if len(reply) <= limit:
+        return [reply]
+
+    width = limit - len(_PRE_OPEN) - len(_PRE_CLOSE) - 2
+    lines: list[str] = []
+    for raw in reply.split("\n"):
+        if len(raw) <= width:
+            lines.append(raw)
+            continue
+        # Peel the pre tags off an over-width line before slicing so a cut can
+        # never land inside a tag and desync the in_pre tracking below.
+        prefix = suffix = ""
+        body = raw
+        if body.startswith(_PRE_OPEN):
+            prefix, body = _PRE_OPEN, body[len(_PRE_OPEN) :]
+        if body.endswith(_PRE_CLOSE):
+            body, suffix = body[: -len(_PRE_CLOSE)], _PRE_CLOSE
+        pieces = _safe_slices(body, width) or [""]
+        pieces[0] = prefix + pieces[0]
+        pieces[-1] = pieces[-1] + suffix
+        lines.extend(pieces)
+
+    chunks: list[str] = []
+    buf = ""
+    in_pre = False
+    for line in lines:
+        sep = "" if not buf or buf == _PRE_OPEN else "\n"
+        if buf and len(buf) + len(sep) + len(line) > limit - len(_PRE_CLOSE):
+            chunks.append(buf + (_PRE_CLOSE if in_pre else ""))
+            buf = _PRE_OPEN if in_pre else ""
+            sep = "" if not buf or buf == _PRE_OPEN else "\n"
+        buf = f"{buf}{sep}{line}"
+        in_pre = _pre_state(line, in_pre)
+    if buf and buf != _PRE_OPEN:
+        chunks.append(buf)
+    return chunks
+
+
 def detect_lang(text: str) -> str:
     """Tiny EN/VI detector: Vietnamese diacritics/letters -> 'vi', else 'en'."""
     for ch in text:
@@ -55,6 +131,7 @@ def format_ack(lang: str) -> str:
 
 
 def format_reply(resp: GeneratedSqlResponse, lang: str = "en") -> str:
+    parts: list[str] = []
     if resp.error_code:
         parts = [f"⚠️ Request could not be completed: {escape(resp.error_code)}"]
         if resp.error_message:
@@ -63,7 +140,6 @@ def format_reply(resp: GeneratedSqlResponse, lang: str = "en") -> str:
     if resp.chat_reply:
         # Conversational (non-SQL) reply — just the message, no SQL chrome.
         return escape(resp.chat_reply)
-    parts: list[str] = []
     if resp.sql:
         parts.append(f'<pre><code class="language-sql">{escape(resp.sql)}</code></pre>')
     if resp.explanation:

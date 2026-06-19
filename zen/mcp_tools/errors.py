@@ -23,6 +23,10 @@ class MetabaseAuthFailedError(McpToolError):
     code = "METABASE_AUTH_FAILED"
 
 
+class MetabaseQueryFailedError(McpToolError):
+    code = "METABASE_QUERY_FAILED"
+
+
 class TableNotFoundError(McpToolError):
     code = "TABLE_NOT_FOUND"
 

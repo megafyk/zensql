@@ -31,11 +31,19 @@ def _in_list_sql(names: Iterable[str], kind: str) -> str:
     return "(" + ",".join(f"'{n}'" for n in validated) + ")"
 
 
+# LIKE escape character. Deliberately not backslash: backslash is also the
+# MySQL string-literal escape, and the doubly-escaped result ("ESCAPE '\'")
+# is unparseable — the backslash eats the closing quote.
+_LIKE_ESCAPE_CHAR = "|"
+
+
 def _escape_like(pattern: str) -> str:
     return (
-        pattern.replace("\\", "\\\\")
-        .replace("%", "\\%")
-        .replace("_", "\\_")
+        pattern.replace(_LIKE_ESCAPE_CHAR, _LIKE_ESCAPE_CHAR * 2)
+        .replace("%", f"{_LIKE_ESCAPE_CHAR}%")
+        .replace("_", f"{_LIKE_ESCAPE_CHAR}_")
+        # Backslash is consumed by the string-literal layer — double it there.
+        .replace("\\", "\\\\")
         .replace("'", "''")
     )
 
@@ -102,7 +110,7 @@ def build_search_query(pattern: str, limit: int, schemas: Iterable[str] | None =
     return (
         "SELECT table_schema, table_name "
         "FROM information_schema.tables "
-        f"WHERE table_name LIKE '%{escaped}%' ESCAPE '\\'"
+        f"WHERE table_name LIKE '%{escaped}%' ESCAPE '{_LIKE_ESCAPE_CHAR}'"
         f"{schema_clause} "
         f"LIMIT {int(limit)}"
     )

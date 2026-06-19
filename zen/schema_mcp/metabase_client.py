@@ -1,8 +1,10 @@
 """Async Metabase API client.
 
-Single instance per Schema MCP process. Owns one `httpx.AsyncClient`,
-authenticates lazily with username/password via `POST /api/session`, refreshes
-the session once on 401, and exposes a narrow read-only surface:
+Single instance per Schema MCP process. Owns one `httpx.AsyncClient`.
+When `METABASE_API_KEY` is set, every request authenticates statelessly via
+the `X-API-KEY` header. Otherwise the client authenticates lazily with
+username/password via `POST /api/session` and refreshes the session once on
+401. Exposes a narrow read-only surface:
 
 - `list_databases()` — `GET /api/database`
 - `run_native_metadata_query(database_id, sql, params=None)` — `POST /api/dataset`
@@ -27,7 +29,12 @@ import sqlglot
 from sqlglot import exp
 
 from zen.config.settings import Settings
-from zen.mcp_tools.errors import MetabaseAuthFailedError, UpstreamTimeoutError, WriteAttemptError
+from zen.mcp_tools.errors import (
+    MetabaseAuthFailedError,
+    MetabaseQueryFailedError,
+    UpstreamTimeoutError,
+    WriteAttemptError,
+)
 
 _DEFAULT_RETRIES = 3
 _BACKOFF_BASE_S = 0.5
@@ -148,13 +155,18 @@ class MetabaseClient:
         token = resp.json().get("id")
         if not token:
             raise MetabaseAuthFailedError("/api/session response missing 'id'")
-        self._session_token = token
-        return token
+        self._session_token = str(token)
+        return self._session_token
 
     async def _ensure_session(self) -> str:
-        if self._session_token is None:
-            return await self.authenticate()
-        return self._session_token
+        if self._session_token is not None:
+            return self._session_token
+        async with self._auth_lock:
+            # Re-check inside the lock: concurrent first calls would otherwise
+            # each pay their own POST /api/session login.
+            if self._session_token is None:
+                return await self._login_locked()
+            return self._session_token
 
     # ------------------------------------------------------------------ low-level
 
@@ -166,14 +178,17 @@ class MetabaseClient:
         json: dict[str, Any] | None = None,
         allow_refresh: bool = True,
     ) -> httpx.Response:
+        api_key = self._settings.metabase_api_key.get_secret_value()
         last_resp: httpx.Response | None = None
         for attempt in range(_DEFAULT_RETRIES):
-            token = await self._ensure_session()
             headers = {
-                "X-Metabase-Session": token,
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             }
+            if api_key:
+                headers["X-API-KEY"] = api_key
+            else:
+                headers["X-Metabase-Session"] = await self._ensure_session()
             try:
                 resp = await self._client.request(
                     method, f"{self.base_url}{path}", headers=headers, json=json
@@ -182,7 +197,7 @@ class MetabaseClient:
                 raise UpstreamTimeoutError(f"metabase {method} {path} timed out") from e
             last_resp = resp
 
-            if resp.status_code == 401 and allow_refresh:
+            if resp.status_code == 401 and not api_key and allow_refresh:
                 self._session_token = None
                 allow_refresh = False
                 continue
@@ -242,4 +257,10 @@ class MetabaseClient:
         if resp.status_code == 401:
             raise MetabaseAuthFailedError("session refresh did not recover from 401")
         resp.raise_for_status()
-        return resp.json()
+        payload: dict[str, Any] = resp.json()
+        # Metabase reports query-execution failures (SQL errors, permission
+        # errors, warehouse outages) in the body under a 2xx status — without
+        # this check they would normalize to "zero rows".
+        if payload.get("status") == "failed" or payload.get("error"):
+            raise MetabaseQueryFailedError(str(payload.get("error") or "query failed")[:500])
+        return payload

@@ -862,6 +862,15 @@ Dependencies:
 
 ### 14.2 Environment variables (`.env.example`)
 
+> **Superseded — see `.env.example` and the README for the live config.** The
+> as-built system removed four settings sketched below: `STRICT_IDENTIFIER_CHECK`
+> (identifier verification now happens inside the agent loop, not the server-side
+> validator), `METABASE_ALLOWED_DATABASE_IDS` (the database allowlist is derived
+> from the registry, see §8/§14), `CODE_GRAPH_REGISTRY_PATH`, and
+> `CODE_GRAPH_SNIPPET_MAX`. `AGENT_TIMEOUT_S` defaults to 300, not 60. The
+> security-control descriptions at §10.2 and the allowlist references at §246/§392
+> reflect the original plan, not the shipped behavior.
+
 ```
 # --- Telegram ---
 TELEGRAM_BOT_TOKEN=

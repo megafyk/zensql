@@ -86,7 +86,8 @@ def normalize_indexes(rows: Sequence[Sequence[Any]]) -> dict[TableKey, list[Inde
         )
     # preserve discovery order
     for table_key, names in order.items():
-        out[table_key].sort(key=lambda i, names=names: names.index(i.name))
+        pos = {n: i for i, n in enumerate(names)}
+        out[table_key].sort(key=lambda idx: pos[idx.name])
     return out
 
 

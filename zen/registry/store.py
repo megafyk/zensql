@@ -1,9 +1,16 @@
-"""Atomic JSON-backed CRUD over the repo registry."""
+"""Atomic JSON-backed CRUD over the repo registry.
+
+Writes are atomic (mkstemp + os.replace) and every mutation holds an
+exclusive flock on a sidecar `<registry>.lock` for its whole load-modify-save
+cycle, so concurrent CLI invocations can't silently overwrite each other's
+updates."""
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import os
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +38,18 @@ class RegistryStore:
     @property
     def path(self) -> Path:
         return self._path
+
+    @contextlib.contextmanager
+    def _exclusive(self) -> Iterator[None]:
+        """Inter-process lock held across a whole load-modify-save cycle."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self._path.with_name(self._path.name + ".lock")
+        with lock_path.open("w") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
     def load(self) -> RegistryDocument:
         if not self._path.exists():
@@ -63,11 +82,12 @@ class RegistryStore:
     # CRUD ----------------------------------------------------------------
 
     def register(self, entry: RepoEntry) -> RepoEntry:
-        doc = self.load()
-        if any(r.name == entry.name for r in doc.repos):
-            raise DuplicateRepoError(f"repo {entry.name!r} already registered")
-        doc.repos.append(entry)
-        self.save(doc)
+        with self._exclusive():
+            doc = self.load()
+            if any(r.name == entry.name for r in doc.repos):
+                raise DuplicateRepoError(f"repo {entry.name!r} already registered")
+            doc.repos.append(entry)
+            self.save(doc)
         return entry
 
     def list_repos(self) -> list[RepoEntry]:
@@ -81,34 +101,36 @@ class RegistryStore:
         raise RepoNotFoundError(f"repo {name!r} not found")
 
     def update(self, name: str, patch: dict[str, Any]) -> RepoEntry:
-        doc = self.load()
-        for i, r in enumerate(doc.repos):
-            if r.name == name:
-                merged = r.model_dump(by_alias=True, mode="json")
-                merged.update(patch)
-                if (
-                    "name" in patch
-                    and patch["name"] != name
-                    and any(
-                        other.name == patch["name"]
-                        for other in doc.repos
-                        if other.name != name
-                    )
-                ):
-                    raise DuplicateRepoError(
-                        f"cannot rename to {patch['name']!r}: already in use"
-                    )
-                updated = RepoEntry.model_validate(merged)
-                doc.repos[i] = updated
-                self.save(doc)
-                return updated
-        raise RepoNotFoundError(f"repo {name!r} not found")
+        with self._exclusive():
+            doc = self.load()
+            for i, r in enumerate(doc.repos):
+                if r.name == name:
+                    merged = r.model_dump(by_alias=True, mode="json")
+                    merged.update(patch)
+                    if (
+                        "name" in patch
+                        and patch["name"] != name
+                        and any(
+                            other.name == patch["name"]
+                            for other in doc.repos
+                            if other.name != name
+                        )
+                    ):
+                        raise DuplicateRepoError(
+                            f"cannot rename to {patch['name']!r}: already in use"
+                        )
+                    updated = RepoEntry.model_validate(merged)
+                    doc.repos[i] = updated
+                    self.save(doc)
+                    return updated
+            raise RepoNotFoundError(f"repo {name!r} not found")
 
     def delete(self, name: str) -> RepoEntry:
-        doc = self.load()
-        for i, r in enumerate(doc.repos):
-            if r.name == name:
-                removed = doc.repos.pop(i)
-                self.save(doc)
-                return removed
-        raise RepoNotFoundError(f"repo {name!r} not found")
+        with self._exclusive():
+            doc = self.load()
+            for i, r in enumerate(doc.repos):
+                if r.name == name:
+                    removed = doc.repos.pop(i)
+                    self.save(doc)
+                    return removed
+            raise RepoNotFoundError(f"repo {name!r} not found")

@@ -97,6 +97,16 @@ def test_strips_credentials_from_details(tmp_path: Path) -> None:
     assert d["agent_api_token"] == "<redacted>"
 
 
+def test_strips_credentials_inside_lists(tmp_path: Path) -> None:
+    logger = AuditLogger(tmp_path)
+    logger.log(
+        "test_event",
+        details={"violations": [{"rule": "X", "password": "hunter2"}]},
+    )
+    payload = json.loads(logger.daily_path().read_text())
+    assert payload["details"]["violations"][0]["password"] == "<redacted>"
+
+
 def test_raw_text_never_appears_in_log(tmp_path: Path) -> None:
     logger = AuditLogger(tmp_path)
     secret_phrase = "this is the user's secret prompt"

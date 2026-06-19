@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import secrets
+from functools import lru_cache
 from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, status
@@ -35,10 +36,15 @@ async def verify_bearer(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
 
-def get_audit_logger_dep(
-    settings: Annotated[Settings, Depends(get_settings_dep)],
-) -> AuditLogger:
-    return AuditLogger(settings.audit_log_dir, actor="agent_server")
+@lru_cache(maxsize=1)
+def _audit_logger_singleton() -> AuditLogger:
+    return AuditLogger(get_settings().audit_log_dir, actor="agent_server")
+
+
+def get_audit_logger_dep() -> AuditLogger:
+    # Process-wide singleton: the logger's write lock only serializes
+    # concurrent emits if every request shares the same instance.
+    return _audit_logger_singleton()
 
 
 def get_orchestrator_dep(

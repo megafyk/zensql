@@ -64,6 +64,10 @@ def _strip_credentials(payload: dict[str, Any]) -> dict[str, Any]:
             out[k] = "<redacted>"
         elif isinstance(v, dict):
             out[k] = _strip_credentials(v)
+        elif isinstance(v, list):
+            # e.g. "violations": [{...}, ...] — dicts inside lists must not
+            # bypass the credential-key scrub.
+            out[k] = [_strip_credentials(i) if isinstance(i, dict) else i for i in v]
         else:
             out[k] = v
     return out

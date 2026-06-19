@@ -8,7 +8,12 @@ import respx
 from pydantic import SecretStr
 
 from zen.config.settings import Settings
-from zen.mcp_tools.errors import MetabaseAuthFailedError, UpstreamTimeoutError, WriteAttemptError
+from zen.mcp_tools.errors import (
+    MetabaseAuthFailedError,
+    MetabaseQueryFailedError,
+    UpstreamTimeoutError,
+    WriteAttemptError,
+)
 from zen.schema_mcp.metabase_client import (
     MetabaseClient,
     _assert_information_schema_only,
@@ -295,6 +300,61 @@ async def test_native_query_exhausts_5xx_retries(no_sleep: None) -> None:
             )
     assert exc.value.response.status_code == 503
     assert route.call_count == 3
+
+
+@respx.mock
+async def test_native_query_body_status_failed_raises() -> None:
+    """Metabase reports query errors as 2xx + status:'failed' in the body —
+    they must not normalize to 'zero rows'."""
+    respx.post("http://metabase.test/api/session").respond(200, json={"id": "s"})
+    respx.post("http://metabase.test/api/dataset").respond(
+        202,
+        json={"status": "failed", "error": "Table 'nope.orders' doesn't exist"},
+    )
+    async with MetabaseClient(_settings()) as client:
+        with pytest.raises(MetabaseQueryFailedError) as exc:
+            await client.run_native_metadata_query(
+                312, "SELECT * FROM information_schema.columns"
+            )
+    assert "doesn't exist" in exc.value.message
+
+
+@respx.mock
+async def test_api_key_mode_skips_session_login() -> None:
+    session_route = respx.post("http://metabase.test/api/session").respond(
+        200, json={"id": "s"}
+    )
+    dataset_route = respx.post("http://metabase.test/api/dataset").respond(
+        200, json={"data": {"cols": [], "rows": []}}
+    )
+    settings = _settings()
+    settings.metabase_api_key = SecretStr("mb_key_123")
+    async with MetabaseClient(settings) as client:
+        await client.run_native_metadata_query(
+            312, "SELECT * FROM information_schema.columns"
+        )
+    assert session_route.called is False
+    assert dataset_route.calls.last.request.headers["X-API-KEY"] == "mb_key_123"
+
+
+@respx.mock
+async def test_concurrent_cold_calls_login_once() -> None:
+    session_route = respx.post("http://metabase.test/api/session").respond(
+        200, json={"id": "s"}
+    )
+    respx.post("http://metabase.test/api/dataset").respond(
+        200, json={"data": {"cols": [], "rows": []}}
+    )
+    async with MetabaseClient(_settings()) as client:
+        await asyncio.gather(
+            *(
+                client.run_native_metadata_query(
+                    312, "SELECT * FROM information_schema.columns"
+                )
+                for _ in range(5)
+            )
+        )
+    assert session_route.call_count == 1
 
 
 @respx.mock

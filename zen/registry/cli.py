@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import IO, Any
 
@@ -40,6 +41,30 @@ def _resolve_path(arg_path: str | None) -> Path:
     if arg_path:
         return Path(arg_path).expanduser()
     return Path(get_settings().registry_path).expanduser()
+
+
+def _check_path_allowed(path: str, stderr: IO[str]) -> int | None:
+    """Enforce CODE_GRAPH_ALLOWED_ROOTS: a registered path is handed to
+    `code-review-graph build` and becomes searchable through the graph tools,
+    so only operator-approved roots may be indexed. Returns a non-zero exit
+    code (after writing the error) when the path must be refused."""
+    roots = get_settings().code_graph_allowed_roots
+    if not roots:
+        return _fail(
+            stderr,
+            "path_not_allowed",
+            "CODE_GRAPH_ALLOWED_ROOTS is not configured — refusing to register "
+            "any path (set it to a comma-separated list of allowed directory roots)",
+        )
+    resolved = Path(path).expanduser().resolve()
+    for root in roots:
+        if resolved.is_relative_to(Path(root).expanduser().resolve()):
+            return None
+    return _fail(
+        stderr,
+        "path_not_allowed",
+        f"path {path!r} is outside CODE_GRAPH_ALLOWED_ROOTS {roots}",
+    )
 
 
 def _emit(stdout: IO[str], payload: dict[str, Any]) -> None:
@@ -69,6 +94,10 @@ def cmd_register(args: argparse.Namespace, stdin: IO[str], stdout: IO[str], stde
             "entry did not match RepoEntry schema",
             details=e.errors(),
         )
+
+    denied = _check_path_allowed(entry.path, stderr)
+    if denied is not None:
+        return denied
 
     store = RegistryStore(_resolve_path(args.registry_path))
     try:
@@ -115,6 +144,10 @@ def cmd_update(args: argparse.Namespace, stdin: IO[str], stdout: IO[str], stderr
         return _fail(stderr, "invalid_json", f"stdin is not valid JSON: {e}")
     if not isinstance(patch, dict):
         return _fail(stderr, "invalid_patch", "patch must be a JSON object")
+    if "path" in patch:
+        denied = _check_path_allowed(str(patch["path"]), stderr)
+        if denied is not None:
+            return denied
 
     store = RegistryStore(_resolve_path(args.registry_path))
     try:
@@ -185,7 +218,8 @@ def main(
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.handler(
+    handler: Callable[[argparse.Namespace, IO[str], IO[str], IO[str]], int] = args.handler
+    return handler(
         args,
         stdin or sys.stdin,
         stdout or sys.stdout,

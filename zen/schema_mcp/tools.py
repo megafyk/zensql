@@ -13,14 +13,25 @@ injection-friendly so tests can supply fakes.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from zen.config.settings import Settings, get_settings
 from zen.mcp_tools.errors import DatabaseNotAllowedError
-from zen.models.metadata import TableMetadata
+from zen.models.metadata import (
+    ColumnMetadata,
+    IndexMetadata,
+    PartitionMetadata,
+    Relationship,
+    TableMetadata,
+)
 from zen.registry.store import RegistryError, RegistryStore
 from zen.schema_mcp import normalizer, queries
+from zen.schema_mcp.normalizer import TableKey
+
+if TYPE_CHECKING:
+    from zen.registry.models import RepoEntry
 
 _WARNING = "Read-only metadata access; SQL is not executed by this system."
 
@@ -38,7 +49,9 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _assert_database_allowed(database_id: int, registry: RegistryStore) -> None:
+def _assert_database_allowed(
+    database_id: int, registry: RegistryStore
+) -> list[RepoEntry]:
     try:
         repos = registry.list_repos()
     except RegistryError as e:
@@ -55,6 +68,33 @@ def _assert_database_allowed(database_id: int, registry: RegistryStore) -> None:
         raise DatabaseNotAllowedError(
             f"database_id {database_id} not in any registered repo's metabase sources"
         )
+    return repos
+
+
+def _schemas_for_database(database_id: int, repos: list[RepoEntry]) -> list[str]:
+    """Distinct schemas the registry declares for `database_id`, in order.
+    Used when the caller omits schema_names — interpolating an empty list
+    would produce `IN (NULL)`, which matches nothing and silently reports
+    every table as missing."""
+    out: list[str] = []
+    for repo in repos:
+        for src in repo.metabase_sources():
+            meta = src.metadata
+            if meta.database_id == database_id and meta.schema_ and meta.schema_ not in out:
+                out.append(meta.schema_)
+    return out
+
+
+def _resolve_schemas(
+    schema_names: list[str] | None, database_id: int, repos: list[RepoEntry]
+) -> list[str]:
+    schemas = schema_names or _schemas_for_database(database_id, repos)
+    if not schemas:
+        raise ValueError(
+            "schema_names is required — no registered metabase source declares "
+            f"a schema for database_id {database_id}"
+        )
+    return schemas
 
 
 def _default_registry(settings: Settings) -> RegistryStore:
@@ -77,43 +117,62 @@ async def get_table_metadata(
 ) -> dict[str, Any]:
     s = settings or get_settings()
     reg = registry or _default_registry(s)
-    _assert_database_allowed(database_id, reg)
+    repos = _assert_database_allowed(database_id, reg)
 
     if not table_names:
         raise ValueError("table_names is required")
-    schemas = schema_names or []
+    schemas = _resolve_schemas(schema_names, database_id, repos)
 
     if client is None:
         raise ValueError("client is required")
 
-    columns_by_table: dict[tuple[str, str], list] = {}
-    indexes_by_table: dict[tuple[str, str], list] = {}
-    partitions_by_table: dict[tuple[str, str], list] = {}
-    rels_by_table: dict[tuple[str, str], list] = {}
-
+    # The enabled queries hit independent information_schema tables — run them
+    # concurrently instead of paying up to four sequential roundtrips.
+    wanted: list[tuple[str, str]] = []
     if include_columns:
-        payload = await client.run_native_metadata_query(
-            database_id, queries.build_columns_query(schemas, table_names)
-        )
-        columns_by_table = normalizer.normalize_columns(normalizer._extract_rows(payload))
+        wanted.append(("columns", queries.build_columns_query(schemas, table_names)))
     if include_indexes:
-        payload = await client.run_native_metadata_query(
-            database_id, queries.build_indexes_query(schemas, table_names)
-        )
-        indexes_by_table = normalizer.normalize_indexes(normalizer._extract_rows(payload))
+        wanted.append(("indexes", queries.build_indexes_query(schemas, table_names)))
     if include_partitions:
-        payload = await client.run_native_metadata_query(
-            database_id, queries.build_partitions_query(schemas, table_names)
-        )
-        partitions_by_table = normalizer.normalize_partitions(
-            normalizer._extract_rows(payload)
-        )
+        wanted.append(("partitions", queries.build_partitions_query(schemas, table_names)))
     if include_relationships:
-        payload = await client.run_native_metadata_query(
-            database_id, queries.build_relationships_query(schemas, table_names)
+        wanted.append(
+            ("relationships", queries.build_relationships_query(schemas, table_names))
         )
+
+    payloads: dict[str, dict[str, Any]] = {}
+    try:
+        async with asyncio.TaskGroup() as tg:
+            pending = {
+                key: tg.create_task(client.run_native_metadata_query(database_id, sql))
+                for key, sql in wanted
+            }
+    except ExceptionGroup as eg:
+        # Re-raise the first underlying error so the MCP boundary still sees
+        # the typed McpToolError instead of an opaque ExceptionGroup.
+        raise eg.exceptions[0] from eg
+    payloads = {key: task.result() for key, task in pending.items()}
+
+    columns_by_table: dict[TableKey, list[ColumnMetadata]] = {}
+    indexes_by_table: dict[TableKey, list[IndexMetadata]] = {}
+    partitions_by_table: dict[TableKey, list[PartitionMetadata]] = {}
+    rels_by_table: dict[TableKey, list[Relationship]] = {}
+
+    if "columns" in payloads:
+        columns_by_table = normalizer.normalize_columns(
+            normalizer._extract_rows(payloads["columns"])
+        )
+    if "indexes" in payloads:
+        indexes_by_table = normalizer.normalize_indexes(
+            normalizer._extract_rows(payloads["indexes"])
+        )
+    if "partitions" in payloads:
+        partitions_by_table = normalizer.normalize_partitions(
+            normalizer._extract_rows(payloads["partitions"])
+        )
+    if "relationships" in payloads:
         rels_by_table = normalizer.normalize_relationships(
-            normalizer._extract_rows(payload)
+            normalizer._extract_rows(payloads["relationships"])
         )
 
     seen_keys: set[tuple[str, str]] = set()
@@ -128,7 +187,7 @@ async def get_table_metadata(
         if schemas and schema not in schemas:
             continue
         tm = TableMetadata(
-            schema=schema,
+            schema_=schema,
             name=name,
             comment=None,
             columns=columns_by_table.get((schema, name), []),
@@ -190,14 +249,15 @@ async def get_relationships(
 ) -> dict[str, Any]:
     s = settings or get_settings()
     reg = registry or _default_registry(s)
-    _assert_database_allowed(database_id, reg)
+    repos = _assert_database_allowed(database_id, reg)
 
     if not table_names:
         raise ValueError("table_names is required")
     if client is None:
         raise ValueError("client is required")
 
-    sql = queries.build_relationships_query(schema_names or [], table_names)
+    schemas = _resolve_schemas(schema_names, database_id, repos)
+    sql = queries.build_relationships_query(schemas, table_names)
     payload = await client.run_native_metadata_query(database_id, sql)
     rels = normalizer.normalize_relationships(normalizer._extract_rows(payload))
 

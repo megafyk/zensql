@@ -163,6 +163,61 @@ async def test_get_table_metadata_columns_only(tmp_path: Path) -> None:
     assert "Read-only" in out["warning"]
 
 
+async def test_omitted_schema_names_uses_registry_schema(tmp_path: Path) -> None:
+    """Without schema_names the registered schema must be interpolated — an
+    empty list would generate `table_schema IN (NULL)`, which matches nothing
+    and silently reports every table as missing."""
+    registry = _registry_with_orders(tmp_path)
+    client = FakeMetabaseClient()
+
+    await tools.get_table_metadata(
+        database_id=312,
+        table_names=["orders"],
+        include_columns=True,
+        settings=_settings(),
+        client=client,
+        registry=registry,
+    )
+
+    assert client.calls, "expected a metadata query"
+    sql = client.calls[0][1]
+    assert "table_schema IN ('cdcn_log_central')" in sql
+    assert "(NULL)" not in sql
+
+
+async def test_no_schema_anywhere_raises(tmp_path: Path) -> None:
+    store = RegistryStore(tmp_path / "registry.json")
+    store.register(
+        RepoEntry(
+            name="no-schema",
+            description="repo without declared schema",
+            path="/srv/repos/no-schema",
+            tags=["x"],
+            connection=[
+                ConnectionBlock(
+                    environment="production",
+                    sources=[
+                        MetabaseSource(
+                            name="metabase",
+                            metadata=MetabaseSourceMetadata(
+                                database="prod", database_id=99
+                            ),
+                        )
+                    ],
+                )
+            ],
+        )
+    )
+    with pytest.raises(ValueError, match="schema_names is required"):
+        await tools.get_table_metadata(
+            database_id=99,
+            table_names=["orders"],
+            settings=_settings(),
+            client=FakeMetabaseClient(),
+            registry=store,
+        )
+
+
 async def test_get_table_metadata_all_includes(tmp_path: Path) -> None:
     registry = _registry_with_orders(tmp_path)
     client = FakeMetabaseClient()
